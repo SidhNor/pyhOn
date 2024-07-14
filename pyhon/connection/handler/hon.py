@@ -24,13 +24,11 @@ class HonConnectionHandler(ConnectionHandler):
         password: str,
         session: Optional[aiohttp.ClientSession] = None,
         mobile_id: str = "",
-        refresh_token: str = "",
     ) -> None:
         super().__init__(session=session)
         self._device: HonDevice = HonDevice(mobile_id)
         self._email: str = email
         self._password: str = password
-        self._refresh_token: str = refresh_token
         if not self._email:
             raise HonAuthenticationError("An email address must be specified")
         if not self._password:
@@ -58,11 +56,9 @@ class HonConnectionHandler(ConnectionHandler):
         return self
 
     async def _check_headers(self, headers: Dict[str, str]) -> Dict[str, str]:
-        if self._refresh_token:
-            await self.auth.refresh(self._refresh_token)
+        print(f"Cognito: {self.auth.cognito_token} ID: {self.auth.id_token}")
         if not (self.auth.cognito_token and self.auth.id_token):
             await self.auth.authenticate()
-        self._refresh_token = self.auth.refresh_token
         headers["cognito-token"] = self.auth.cognito_token
         headers["id-token"] = self.auth.id_token
         return self._HEADERS | headers
@@ -72,13 +68,15 @@ class HonConnectionHandler(ConnectionHandler):
         self, method: Callback, url: str | URL, *args: Any, **kwargs: Any
     ) -> AsyncIterator[aiohttp.ClientResponse]:
         loop: int = kwargs.pop("loop", 0)
+        print("AHTUNG")
+        print(f"Cognito: {self.auth.cognito_token} ID: {self.auth.id_token}")
         kwargs["headers"] = await self._check_headers(kwargs.get("headers", {}))
         async with method(url, *args, **kwargs) as response:
             if (
                 self.auth.token_expires_soon or response.status in [401, 403]
             ) and loop == 0:
                 _LOGGER.info("Try refreshing token...")
-                await self.auth.refresh(self._refresh_token)
+                await self.auth.refresh()
                 async with self._intercept(
                     method, url, *args, loop=loop + 1, **kwargs
                 ) as result:

@@ -1,3 +1,5 @@
+import asyncio
+import aiohttp
 import json
 import logging
 import re
@@ -57,6 +59,13 @@ class HonAuth:
         self._device = device
         self._expires: datetime = datetime.utcnow()
         self._auth = HonAuthData()
+        self._frontdoor_url = ""
+        self._start_time    = time.time()
+
+        self._header = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.0.0 Safari/537.36"
+        }
+        self._session = aiohttp.ClientSession(headers=self._header)
 
     @property
     def cognito_token(self) -> str:
@@ -100,169 +109,62 @@ class HonAuth:
         nonce = secrets.token_hex(16)
         return f"{nonce[:8]}-{nonce[8:12]}-{nonce[12:16]}-{nonce[16:20]}-{nonce[20:]}"
 
-    async def _load_login(self) -> bool:
-        login_url = await self._introduce()
-        login_url = await self._handle_redirects(login_url)
-        return await self._login_url(login_url)
-
-    async def _introduce(self) -> str:
-        redirect_uri = urllib.parse.quote(f"{const.APP}://mobilesdk/detect/oauth/done")
-        params = {
-            "response_type": "token+id_token",
-            "client_id": const.CLIENT_ID,
-            "redirect_uri": redirect_uri,
-            "display": "touch",
-            "scope": "api openid refresh_token web",
-            "nonce": self._generate_nonce(),
-        }
-        params_encode = "&".join([f"{k}={v}" for k, v in params.items()])
-        url = f"{const.AUTH_API}/services/oauth2/authorize/expid_Login?{params_encode}"
-        async with self._request.get(url) as response:
-            text = await response.text()
-            self._expires = datetime.utcnow()
-            login_url: List[str] = re.findall("url = '(.+?)'", text)
-            if not login_url:
-                if "oauth/done#access_token=" in text:
-                    self._parse_token_data(text)
-                    raise exceptions.HonNoAuthenticationNeeded()
-                await self._error_logger(response)
-        return login_url[0]
-
-    async def _manual_redirect(self, url: str) -> str:
-        async with self._request.get(url, allow_redirects=False) as response:
-            if not (new_location := response.headers.get("Location", "")):
-                await self._error_logger(response)
-        return new_location
-
-    async def _handle_redirects(self, login_url: str) -> str:
-        redirect1 = await self._manual_redirect(login_url)
-        redirect2 = await self._manual_redirect(redirect1)
-        return f"{redirect2}&System=IoT_Mobile_App&RegistrationSubChannel=hOn"
-
-    async def _login_url(self, login_url: str) -> bool:
-        headers = {"user-agent": const.USER_AGENT}
-        url = URL(login_url, encoded=True)
-        async with self._request.get(url, headers=headers) as response:
-            text = await response.text()
-            if context := re.findall('"fwuid":"(.*?)","loaded":(\\{.*?})', text):
-                fw_uid, loaded_str = context[0]
-                self._login_data.fw_uid = fw_uid
-                self._login_data.loaded = json.loads(loaded_str)
-                self._login_data.url = login_url.replace(const.AUTH_API, "")
-                return True
-            await self._error_logger(response)
-        return False
-
-    async def _login(self) -> str:
-        start_url = self._login_data.url.rsplit("startURL=", maxsplit=1)[-1]
-        start_url = parse.unquote(start_url).split("%3D")[0]
-        action = {
-            "id": "79;a",
-            "descriptor": "apex://LightningLoginCustomController/ACTION$login",
-            "callingDescriptor": "markup://c:loginForm",
-            "params": {
-                "username": self._login_data.email,
-                "password": self._login_data.password,
-                "startUrl": start_url,
-            },
-        }
-        data = {
-            "message": {"actions": [action]},
-            "aura.context": {
-                "mode": "PROD",
-                "fwuid": self._login_data.fw_uid,
-                "app": "siteforce:loginApp2",
-                "loaded": self._login_data.loaded,
-                "dn": [],
-                "globals": {},
-                "uad": False,
-            },
-            "aura.pageURI": self._login_data.url,
-            "aura.token": None,
-        }
-        params = {"r": 3, "other.LightningLoginCustom.login": 1}
-        async with self._request.post(
-            const.AUTH_API + "/s/sfsites/aura",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data="&".join(f"{k}={quote(json.dumps(v))}" for k, v in data.items()),
-            params=params,
-        ) as response:
-            if response.status == 200:
-                with suppress(json.JSONDecodeError, KeyError):
-                    result = await response.json()
-                    url: str = result["events"][0]["attributes"]["values"]["url"]
-                    return url
-            await self._error_logger(response)
-            return ""
-
-    def _parse_token_data(self, text: str) -> bool:
-        if access_token := re.findall("access_token=(.*?)&", text):
-            self._auth.access_token = access_token[0]
-        if refresh_token := re.findall("refresh_token=(.*?)&", text):
-            self._auth.refresh_token = parse.unquote(refresh_token[0])
-        if id_token := re.findall("id_token=(.*?)&", text):
-            self._auth.id_token = id_token[0]
-        return bool(access_token and refresh_token and id_token)
-
-    async def _get_token(self, url: str) -> bool:
-        async with self._request.get(url) as response:
-            if response.status != 200:
-                await self._error_logger(response)
-                return False
-            url_search = re.findall(
-                "href\\s*=\\s*[\"'](.+?)[\"']", await response.text()
-            )
-            if not url_search:
-                await self._error_logger(response)
-                return False
-        if "ProgressiveLogin" in url_search[0]:
-            async with self._request.get(url_search[0]) as response:
-                if response.status != 200:
-                    await self._error_logger(response)
-                    return False
-                url_search = re.findall(
-                    "href\\s*=\\s*[\"'](.*?)[\"']", await response.text()
-                )
-        url = const.AUTH_API + url_search[0]
-        async with self._request.get(url) as response:
-            if response.status != 200:
-                await self._error_logger(response)
-                return False
-            if not self._parse_token_data(await response.text()):
-                await self._error_logger(response)
-                return False
-        return True
-
-    async def _api_auth(self) -> bool:
-        post_headers = {"id-token": self._auth.id_token}
-        data = self._device.get()
-        async with self._request.post(
-            f"{const.API_URL}/auth/v1/login", headers=post_headers, json=data
-        ) as response:
-            try:
-                json_data = await response.json()
-            except json.JSONDecodeError:
-                await self._error_logger(response)
-                return False
-            self._auth.cognito_token = json_data.get("cognitoUser", {}).get("Token", "")
-            if not self._auth.cognito_token:
-                _LOGGER.error(json_data)
-                raise exceptions.HonAuthenticationError()
-        return True
-
     async def authenticate(self) -> None:
         self.clear()
         try:
-            if not await self._load_login():
-                raise exceptions.HonAuthenticationError("Can't open login page")
-            if not (url := await self._login()):
-                raise exceptions.HonAuthenticationError("Can't login")
-            if not await self._get_token(url):
-                raise exceptions.HonAuthenticationError("Can't get token")
-            if not await self._api_auth():
-                raise exceptions.HonAuthenticationError("Can't get api token")
+            if not await self._authenticate():
+                raise exceptions.HonAuthenticationError("Could not authenticate")
         except exceptions.HonNoAuthenticationNeeded:
             return
+
+    async def _authenticate(self) -> bool:
+        self._auth.access_token = access_token[0]
+        self._auth.refresh_token = parse.unquote(refresh_token[0])
+        self._auth.id_token = id_token[0]
+
+    async def _async_get_frontdoor_url(self, error_code=0):
+
+        data = (
+            "message=%7B%22actions%22%3A%5B%7B%22id%22%3A%2279%3Ba%22%2C%22descriptor%22%3A%22apex%3A%2F%2FLightningLoginCustomController%2FACTION%24login%22%2C%22callingDescriptor%22%3A%22markup%3A%2F%2Fc%3AloginForm%22%2C%22params%22%3A%7B%22username%22%3A%22"
+            + urllib.parse.quote(self._email)
+            + "%22%2C%22password%22%3A%22"
+            + urllib.parse.quote(self._password)
+            + "%22%2C%22startUrl%22%3A%22%22%7D%7D%5D%7D&aura.context=%7B%22mode%22%3A%22PROD%22%2C%22fwuid%22%3A%22"
+            + urllib.parse.quote(self._framework)
+            + "%22%2C%22app%22%3A%22siteforce%3AloginApp2%22%2C%22loaded%22%3A%7B%22APPLICATION%40markup%3A%2F%2Fsiteforce%3AloginApp2%22%3A%22YtNc5oyHTOvavSB9Q4rtag%22%7D%2C%22dn%22%3A%5B%5D%2C%22globals%22%3A%7B%7D%2C%22uad%22%3Afalse%7D&aura.pageURI=%2FSmartHome%2Fs%2Flogin%2F%3Flanguage%3Dfr&aura.token=null"
+        )
+
+        async with self._session.post(
+            f"{const.AUTH_API}/s/sfsites/aura?r=3&other.LightningLoginCustom.login=1",
+            headers={"Content-Type": "application/x-www-form-urlencoded; charset=UTF-8"},
+            data=data,
+        ) as resp:
+            if resp.status != 200:
+                _LOGGER.error("Unable to connect to the login service: " + str(resp.status))
+                return False
+
+            text = await resp.text()
+            try:
+                json_data = json.loads(text)
+                self._frontdoor_url = json_data["events"][0]["attributes"]["values"]["url"]
+            except:
+                # Framework must be updated
+                if text.find("clientOutOfSync") > 0 and error_code != 2:
+                    start = text.find("Expected: ") + 10
+                    end = text.find(" ", start)
+                    _LOGGER.debug("Framework update from ["+ self._framework+ "] to ["+ text[start:end]+ "]")
+                    self._framework = text[start:end]
+                    return await self._async_get_frontdoor_url(2)
+                _LOGGER.error("Unable to retreive the frontdoor URL. Message: " + text)
+                return 1
+
+        if error_code == 2 and self._entry != None:
+            # Update Framework
+            data = {**self._entry.data}
+            data[CONF_FRAMEWORK] = self._framework
+            self._hass.config_entries.async_update_entry(self._entry, data=data)
+
+        return 0
 
     async def refresh(self, refresh_token: str = "") -> bool:
         if refresh_token:

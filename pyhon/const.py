@@ -1,4 +1,5 @@
 AUTH_API = "https://account2.hon-smarthome.com"
+AUTH_API2 = "https://account2.hon-smarthome.com/SmartHome"
 API_URL = "https://api-iot.he.services"
 API_KEY = "GRCqFhC6Gk@ikWXm1RmnSmX1cm,MxY-configuration"
 AWS_ENDPOINT = "a30f6tqw0oh1x0-ats.iot.eu-west-1.amazonaws.com"
